@@ -1,0 +1,89 @@
+name: Scheduled drift report
+
+on:
+  schedule:
+    - cron: '17 6 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'Baseline branch, tag, or SHA to compare from'
+        required: false
+        default: 'main'
+        type: string
+      target:
+        description: 'Target branch, tag, or SHA to compare to'
+        required: false
+        default: 'HEAD'
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  report-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASELINE: ${{ inputs.baseline || 'main' }}
+      TARGET: ${{ inputs.target || 'HEAD' }}
+      # Prefer the protected fine-grained token when configured; github.token is a read-only fallback.
+      GITHUB_TOKEN: ${{ secrets.DRIFT_GITHUB_TOKEN || github.token }}
+      DRIFT_WEBHOOK_URL: ${{ secrets.DRIFT_WEBHOOK_URL }}
+    steps:
+      - name: Check out target history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch comparison refs and calculate drift
+        id: drift
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .drift-input drift-report
+          resolve_ref() {
+            local ref="$1"
+            if git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+              printf '%s\n' "$ref"
+            elif git fetch --no-tags origin "$ref" && git rev-parse --verify --quiet FETCH_HEAD^{commit} >/dev/null; then
+              git rev-parse FETCH_HEAD
+            else
+              echo "::error::Unable to fetch or resolve comparison ref '$ref'." >&2
+              exit 1
+            fi
+          }
+          baseline_ref="$(resolve_ref "$BASELINE")"
+          target_ref="$(resolve_ref "$TARGET")"
+          printf '%s\n' "$baseline_ref" > .drift-input/baseline-ref.txt
+          printf '%s\n' "$target_ref" > .drift-input/target-ref.txt
+          # Keep the exact Git commands and their unprocessed output in the artifact.
+          git diff --name-status "$baseline_ref...$target_ref" | tee .drift-input/name-status.txt
+          git diff --numstat "$baseline_ref...$target_ref" > .drift-input/numstat.txt
+          git diff --stat "$baseline_ref...$target_ref" > .drift-input/stat.txt
+          git diff --shortstat "$baseline_ref...$target_ref" > .drift-input/shortstat.txt
+          git log --format='%H%x1f%an%x1f%ae%x1f%aI%x1f%s' "$baseline_ref..$target_ref" > .drift-input/commits.txt
+          python3 scripts/fetch_github_pull_requests.py --repository "$GITHUB_REPOSITORY" --commits-file .drift-input/commits.txt --output .drift-input/pull-requests.json
+          python3 scripts/build_drift_report.py --baseline "$baseline_ref" --target "$target_ref" --input-dir .drift-input --output-dir drift-report
+          if [[ -s .drift-input/name-status.txt ]]; then echo 'detected=true' >> "$GITHUB_OUTPUT"; else echo 'detected=false' >> "$GITHUB_OUTPUT"; fi
+
+      - name: Publish job summary
+        if: always() && hashFiles('drift-report/drift-report.md') != ''
+        run: cat drift-report/drift-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload drift report
+        if: always() && hashFiles('drift-report/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report-${{ github.run_id }}
+          path: drift-report/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Notify configured webhook about detected drift
+        if: success() && steps.drift.outputs.detected == 'true' && env.DRIFT_WEBHOOK_URL != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload=$(python3 -c 'import json, os; print(json.dumps({"text": f"Drift detected in {os.environ[\"GITHUB_REPOSITORY\"]}: {os.environ[\"GITHUB_SERVER_URL\"]}/{os.environ[\"GITHUB_REPOSITORY\"]}/actions/runs/{os.environ[\"GITHUB_RUN_ID\"]}"}))')
+          curl --fail --silent --show-error --retry 3 --header 'Content-Type: application/json' --data "$payload" "$DRIFT_WEBHOOK_URL"
