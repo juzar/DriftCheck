@@ -23,18 +23,28 @@ def parse_numstat(raw: str) -> list[dict]:
         if len(parts) != 3:
             continue
         added, removed, name = parts
-        entries.append({"path": name, "additions": None if added == "-" else int(added),
-                        "deletions": None if removed == "-" else int(removed)})
+        try:
+            additions = None if added == "-" else int(added)
+            deletions = None if removed == "-" else int(removed)
+        except ValueError as error:
+            raise ValueError(f"Invalid numstat entry: {line!r}") from error
+        entries.append({"path": name, "additions": additions, "deletions": deletions})
     return entries
 
 
 def parse_commits(raw: str, prs: dict) -> list[dict]:
     commits = []
-    for line in raw.splitlines():
-        sha, author, email, authored_at, subject = line.split("\x1f", 4)
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        parts = line.split("\x1f", 4)
+        if len(parts) != 5 or not parts[0]:
+            raise ValueError(f"Invalid commits entry on line {line_number}")
+        sha, author, email, authored_at, subject = parts
+        pull_requests = prs.get(sha, [])
+        if not isinstance(pull_requests, list):
+            raise ValueError(f"Pull-request mapping for commit {sha} must be a list")
         commits.append({"sha": sha, "author": author, "email": email,
                         "authored_at": authored_at, "subject": subject,
-                        "pull_requests": prs.get(sha, [])})
+                        "pull_requests": pull_requests})
     return commits
 
 
@@ -46,7 +56,9 @@ def markdown(report: dict) -> str:
     for row in report["diff"]["name_status"]:
         status, path = (row.split("\t", 1) + [""])[:2]
         count = nums.get(path, {})
-        output.append(f"| `{status}` | `{path}` | {count.get('additions', '')} | {count.get('deletions', '')} |")
+        safe_status = status.replace("\\", "\\\\").replace("`", "\\`").replace("|", "\\|")
+        safe_path = path.replace("\\", "\\\\").replace("`", "\\`").replace("|", "\\|").replace("\n", "\\n").replace("\r", "\\r")
+        output.append(f"| `{safe_status}` | `{safe_path}` | {count.get('additions', '')} | {count.get('deletions', '')} |")
     if not report["diff"]["name_status"]:
         output.append("| — | No changed files | 0 | 0 |")
     output.extend(["", "## Commits and merged pull requests", ""])
@@ -72,7 +84,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     data = args.input_dir
-    prs = json.loads(read(data / "pull-requests.json") or "{}")
+    try:
+        prs = json.loads(read(data / "pull-requests.json") or "{}")
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid pull-request mapping JSON: {error}") from error
+    if not isinstance(prs, dict):
+        raise SystemExit("Pull-request mapping must be a JSON object")
     report = {"generated_at": datetime.now(timezone.utc).isoformat(), "baseline": args.baseline,
               "target": args.target, "diff": {"name_status_raw": read(data / "name-status.txt").rstrip(),
               "name_status": lines(data / "name-status.txt"), "numstat": parse_numstat(read(data / "numstat.txt")),

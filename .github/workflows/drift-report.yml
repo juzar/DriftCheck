@@ -44,9 +44,13 @@ jobs:
           mkdir -p .drift-input drift-report
           resolve_ref() {
             local ref="$1"
-            if git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+            if [[ -z "$ref" || "$ref" == -* || "$ref" == *$'\n'* || "$ref" == *$'\r'* ]]; then
+              echo "::error::Invalid comparison ref." >&2
+              exit 1
+            fi
+            if git rev-parse --verify --quiet --end-of-options "${ref}^{commit}" >/dev/null; then
               printf '%s\n' "$ref"
-            elif git fetch --no-tags origin "$ref" && git rev-parse --verify --quiet FETCH_HEAD^{commit} >/dev/null; then
+            elif git fetch --no-tags origin -- "$ref" && git rev-parse --verify --quiet FETCH_HEAD^{commit} >/dev/null; then
               git rev-parse FETCH_HEAD
             else
               echo "::error::Unable to fetch or resolve comparison ref '$ref'." >&2
